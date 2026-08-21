@@ -2598,6 +2598,27 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
+    # Agent-backed providers registered out-of-tree (see
+    # agent/model_client_factories.py). Consulted before the built-in facade
+    # chain below so a plugin in $HERMES_HOME can supply a client for a
+    # provider whose endpoint is a local subprocess rather than an HTTP
+    # service. Returns None for every ordinary provider.
+    from agent.model_client_factories import resolve_model_client_factory
+    _agent_client_factory = resolve_model_client_factory(
+        getattr(agent, "provider", ""), client_kwargs.get("base_url")
+    )
+    if _agent_client_factory is not None:
+        client = _agent_client_factory(
+            agent=agent, client_kwargs=client_kwargs, reason=reason, shared=shared
+        )
+        _ra().logger.info(
+            "Agent-backed model client created (%s, %s, shared=%s) %s",
+            getattr(agent, "provider", "?"),
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
