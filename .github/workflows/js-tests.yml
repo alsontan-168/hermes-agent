@@ -57,44 +57,22 @@ jobs:
         with:
           command: npm ci
 
-      # ``npm run --ws check`` stops at the first workspace that fails, which
-      # would report one failure per run where the old matrix reported all of
-      # them at once (it set ``fail-fast: false``). Run each workspace's check
-      # separately and collect the exit codes so one broken package does not
-      # hide the state of the rest.
+      # Every check runs concurrently, and the step fails only after all of
+      # them finish. Two reasons this is not ``npm run --ws check``:
       #
-      # Workspace discovery is ``npm query .workspace`` — the same source the
-      # old matrix-generation job used — so a new package is picked up with no
-      # change here. An empty list is an error, not an empty run: it would
-      # otherwise report green having checked nothing.
+      #   * ``--ws`` is serial and stops at the first failing workspace, so a
+      #     run reports one failure where the matrix this replaced reported
+      #     every failure at once.
+      #   * The unit of work is a CHECK, not a workspace. apps/desktop is most
+      #     of the payload and its own ``check`` is a serial && chain, so
+      #     spreading only across workspaces leaves that chain as the long
+      #     pole. Expanding a package's ``check:*`` sub-scripts (the same
+      #     selection rule the old matrix job used) puts its lint, ui, electron
+      #     and plugin suites in flight together.
+      #
+      # Discovery is ``npm query .workspace``, so a new package or a new
+      # ``check:*`` script is picked up with no change here. An empty list is
+      # an error, not an empty run: it would otherwise report green having
+      # checked nothing.
       - name: Run all workspace checks
-        run: |
-          set -uo pipefail
-
-          mapfile -t PKGS < <(npm query .workspace --json \
-            | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8")).forEach(p=>{if((p.scripts||{}).check)console.log(p.location)})')
-
-          if [ "${#PKGS[@]}" -eq 0 ]; then
-            echo "::error::No workspace package declares a check script — refusing to report green having run nothing."
-            exit 1
-          fi
-
-          echo "checking ${#PKGS[@]} workspace(s): ${PKGS[*]}"
-
-          failed=()
-          for pkg in "${PKGS[@]}"; do
-            echo "::group::$pkg"
-            if npm run --prefix "$pkg" check; then
-              echo "::endgroup::"
-            else
-              echo "::endgroup::"
-              echo "::error::$pkg check failed"
-              failed+=("$pkg")
-            fi
-          done
-
-          if [ "${#failed[@]}" -gt 0 ]; then
-            echo "::error::${#failed[@]} workspace check(s) failed: ${failed[*]}"
-            exit 1
-          fi
-          echo "all ${#PKGS[@]} workspace checks passed"
+        run: node .github/scripts/run-workspace-checks.mjs
