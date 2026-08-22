@@ -581,12 +581,14 @@ def _(rid, params: dict) -> dict:
 
     Params: ``name`` (required). Result:
     ``{name, description, soul, model: {provider, default}, skills:
-    [{name, enabled}], toolsets: [{name, description, tool_count, enabled}]}``
+    [{name, enabled}], toolsets: [{name, description, tool_count, enabled}],
+    terminal_cwd: str}``
 
     Skill enablement mirrors the disabled-list model (installed = enabled
     unless in ``skills.disabled``). Toolset enablement reports the profile's
     ``tools.enabled_toolsets`` pin, or every toolset enabled when unpinned.
-    All reads are scoped to the profile via the HERMES_HOME override.
+    ``terminal_cwd`` is the profile's resolved project folder ('' when
+    unset). All reads are scoped to the profile via the HERMES_HOME override.
     """
     name = str(params.get("name") or "").strip()
     if not name:
@@ -716,6 +718,21 @@ def _(rid, params: dict) -> dict:
 
             model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
 
+            # Resolved project folder (terminal.cwd). Relative values are
+            # resolved against the profile dir so the editor shows where
+            # shells ACTUALLY start; unset → ''.
+            terminal_cfg = cfg.get("terminal") if isinstance(cfg.get("terminal"), dict) else {}
+            raw_cwd = str(terminal_cfg.get("cwd") or "").strip()
+            terminal_cwd = ""
+            if raw_cwd:
+                cwd_path = Path(raw_cwd)
+                if not cwd_path.is_absolute():
+                    cwd_path = profile_dir / cwd_path
+                try:
+                    terminal_cwd = str(cwd_path.resolve())
+                except Exception:
+                    terminal_cwd = raw_cwd
+
             description = ""
             try:
                 from hermes_cli.profiles import read_profile_meta
@@ -738,6 +755,7 @@ def _(rid, params: dict) -> dict:
                     "toolsets": toolsets_out,
                     "toolsets_pinned": pinned_set is not None,
                     "mcp_servers": mcp_out,
+                    "terminal_cwd": terminal_cwd,
                 },
             )
         finally:
@@ -755,7 +773,10 @@ def _(rid, params: dict) -> dict:
     ``model`` + ``provider`` (both required together),
     ``disabled_skills`` (list[str], replace semantics),
     ``enabled_toolsets`` (list[str], replace semantics; empty list clears
-    the pin so every toolset is enabled again), and
+    the pin so every toolset is enabled again),
+    ``terminal_cwd`` (str: absolute project path or '~'-prefixed; stored as
+    the profile's ``terminal.cwd`` so agent shells start there; ``None``
+    or empty clears it back to the profile-home default), and
     ``ui_meta_expected_revisions`` (dict[str, int], optional compare-and-swap
     preconditions for keys supplied in ``ui_meta``).
 
@@ -897,6 +918,7 @@ def _(rid, params: dict) -> dict:
             isinstance(params.get("disabled_skills"), list)
             or isinstance(params.get("enabled_toolsets"), list)
             or isinstance(params.get("enabled_mcp_servers"), list)
+            or "terminal_cwd" in params
         )
         if needs_cfg:
             # Launch profile's MCP catalog, read BEFORE the home override
@@ -984,6 +1006,46 @@ def _(rid, params: dict) -> dict:
                         applied["mcp_servers"] = True
                     except Exception:
                         applied["mcp_servers"] = False
+
+                # ``terminal_cwd`` (str | None): project folder this bot's
+                # agent shells start in — T3-Code-style workspace binding.
+                # Pointer, not prison: tools stay global, only the default
+                # cwd changes. '~' expands against the REAL user home (read
+                # before the override flips HOME); relative paths are
+                # resolved against the profile dir. Empty/None clears back
+                # to the profile-home default.
+                if "terminal_cwd" in params:
+                    try:
+                        raw = params.get("terminal_cwd")
+                        wanted = str(raw or "").strip()
+                        if wanted:
+                            expanded = Path(wanted).expanduser()
+                            if not expanded.is_absolute():
+                                expanded = (profile_dir / expanded).resolve()
+                            else:
+                                expanded = expanded.resolve()
+                            if not expanded.is_dir():
+                                raise ValueError(f"not a directory: {wanted}")
+                            resolved = str(expanded)
+                        else:
+                            resolved = ""
+
+                        cfg = load_config() or {}
+                        term_cfg = (
+                            cfg.get("terminal") if isinstance(cfg.get("terminal"), dict) else {}
+                        )
+                        if resolved:
+                            term_cfg["cwd"] = resolved
+                        else:
+                            term_cfg.pop("cwd", None)
+                        if term_cfg:
+                            cfg["terminal"] = term_cfg
+                        elif "terminal" in cfg:
+                            cfg.pop("terminal", None)
+                        save_config(cfg)
+                        applied["terminal_cwd"] = True
+                    except Exception:
+                        applied["terminal_cwd"] = False
             finally:
                 reset_hermes_home_override(token)
 

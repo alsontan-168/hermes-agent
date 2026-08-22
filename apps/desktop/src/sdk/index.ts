@@ -1372,6 +1372,7 @@ export type { TitlebarTool } from '@/app/shell/titlebar-controls'
  *  builds without it would route the pin to the ACTIVE gateway. Bot Mode's
  *  Advanced section is the reference consumer. */
 export { SkillsView } from '@/app/skills'
+export { selectDesktopPaths } from '@/lib/desktop-fs'
 /** THE full MCP tab core Settings renders — per-server enable + OAuth sign-in
  *  + API-key setup + live probes, not a checkbox list. Route-decoupled so it
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
