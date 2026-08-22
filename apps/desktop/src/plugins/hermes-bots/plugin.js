@@ -82,6 +82,10 @@ const blobatarSvg = typeof sdk === 'undefined' ? undefined : sdk.blobatarSvg
 // Budgeted render loop (fps cap + observability pause + dormancy + teardown).
 // Feature-detected: older desktops fall back to the hand-rolled clock below.
 const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBudgetedLoop
+// Native folder picker (Electron selectPaths bridge). Feature-detected: the
+// Browse button hides when missing — typing a path always works.
+const pickDesktopFolder =
+  typeof sdk === 'undefined' ? undefined : sdk.selectDesktopPaths
 
 const ID = 'hermes-bots'
 /** Tree pane id of the Bots home workspace tab (openWorkspace prefixes
@@ -9114,6 +9118,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           provider: res.model?.provider || '',
           model: res.model?.default || '',
           soul: res.soul || '',
+          cwd: res.terminal_cwd || '',
           skills: res.skills || [],
           toolsets: res.toolsets || [],
           mcp: [
@@ -9178,6 +9183,48 @@ function AdvancedProfileConfig({ bot, state, setState }) {
   const mcpList = state.mcp || []
   const enabledMcp = mcpList.filter(m => m.enabled).length
 
+  const pickProjectFolder = async () => {
+    try {
+      const paths = await pickDesktopFolder?.({
+        directories: true,
+        multiple: false,
+        title: 'Choose the project folder this agent works in',
+        ...(state.cwd.trim() ? { defaultPath: state.cwd.trim() } : {})
+      })
+      const picked = paths?.[0]
+      if (picked) {
+        setState(prev => ({ ...prev, dirtyCwd: true, cwd: picked }))
+      }
+    } catch {
+      /* picker unavailable — the text input still works */
+    }
+  }
+
+  const projectFolderField = labeled(
+    'Project folder (where this agent starts working)',
+    jsxs('div', {
+      className: 'flex gap-1.5',
+      children: [
+        jsx(Input, {
+          className: 'h-7 flex-1 text-xs',
+          placeholder: '/absolute/path/to/project — empty = profile home',
+          value: state.cwd,
+          onChange: event => setState(prev => ({ ...prev, dirtyCwd: true, cwd: event.target.value }))
+        }),
+        Boolean(pickDesktopFolder)
+          ? jsx(Button, {
+              size: 'sm',
+              variant: 'ghost',
+              className: 'shrink-0 px-2 font-semibold',
+              title: 'Browse for a folder',
+              onClick: () => void pickProjectFolder(),
+              children: 'Browse…'
+            })
+          : null
+      ]
+    })
+  )
+
   // Newer desktop builds export the WHOLE core Capabilities surface
   // (hermes-agent#87317): Skills (installed list + one-click hub installs +
   // full-skill detail), Tools (per-toolset config), and MCP — pinned to this
@@ -9194,6 +9241,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
           value: { provider: state.provider, model: state.model },
           onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
         }),
+        projectFolderField,
         labeled(
           'Capabilities (applies immediately — skills, tools, MCP)',
           jsx('div', {
@@ -9251,6 +9299,7 @@ function AdvancedProfileConfig({ bot, state, setState }) {
         value: { provider: state.provider, model: state.model },
         onChange: patch => setState(prev => ({ ...prev, dirtyModel: true, ...patch }))
       }),
+      projectFolderField,
       labeled(
         `Skills (${enabledSkills}/${state.skills.length} enabled)`,
         jsxs('div', {
@@ -9678,11 +9727,13 @@ function emptyAdvancedState() {
     provider: '',
     model: '',
     soul: '',
+    cwd: '',
     skills: [],
     toolsets: [],
     mcp: [],
     dirtyModel: false,
     dirtySoul: false,
+    dirtyCwd: false,
     dirtySkills: false,
     dirtyToolsets: false,
     dirtyMcp: false
@@ -9696,6 +9747,12 @@ async function applyAdvancedConfig(bot, state) {
 
   if (state.dirtySoul) {
     payload.soul = ensureMessagingProtocol(state.soul, bot.name, $lastRoster.get())
+  }
+
+  if (state.dirtyCwd) {
+    // Empty clears the binding (backend removes terminal.cwd → profile-home
+    // default). '~'-prefixed paths are expanded server-side.
+    payload.terminal_cwd = state.cwd.trim() || null
   }
 
   if (state.dirtyModel) {
@@ -9832,7 +9889,7 @@ function EditProfileDialog({ bot, open, onClose }) {
       }
     }
 
-    if (adv.loaded && (adv.dirtyModel || adv.dirtySoul || adv.dirtySkills || adv.dirtyToolsets || adv.dirtyMcp)) {
+    if (adv.loaded && (adv.dirtyModel || adv.dirtySoul || adv.dirtyCwd || adv.dirtySkills || adv.dirtyToolsets || adv.dirtyMcp)) {
       try {
         const res = await applyAdvancedConfig(bot, adv)
         const failed = Object.entries(res?.applied || {}).filter(([, ok]) => !ok)
