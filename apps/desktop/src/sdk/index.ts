@@ -1372,7 +1372,6 @@ export type { TitlebarTool } from '@/app/shell/titlebar-controls'
  *  builds without it would route the pin to the ACTIVE gateway. Bot Mode's
  *  Advanced section is the reference consumer. */
 export { SkillsView } from '@/app/skills'
-export { selectDesktopPaths } from '@/lib/desktop-fs'
 /** THE full MCP tab core Settings renders — per-server enable + OAuth sign-in
  *  + API-key setup + live probes, not a checkbox list. Route-decoupled so it
  *  renders anywhere (a plugin dialog); pass a live `gateway` (see
@@ -1453,10 +1452,10 @@ export type {
  *  `ctx.register` stays the door for permanent contributions. Namespace the
  *  id with your plugin slug (`kanban:board-switcher`). */
 export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
+export type { Contribution } from '@/contrib/types'
 
 // -- contracts ----------------------------------------------------------------
 
-export type { Contribution } from '@/contrib/types'
 /** The live gateway instance type — for typing the `gateway` prop `McpTab`
  *  takes; obtain the instance from `host.getGateway()`. */
 export type { HermesGateway } from '@/hermes'
@@ -1481,6 +1480,7 @@ export {
  *  Plugins must route animation clocks through this instead of raw rAF loops
  *  so a disabled plugin or an empty roster costs zero frames. */
 export { type BudgetedLoop, type BudgetedLoopOptions, createBudgetedLoop } from '@/lib/budgeted-loop'
+export { selectDesktopPaths } from '@/lib/desktop-fs'
 /** THE compact-number formatter — every user-facing count/token figure goes
  *  through here (1230 → "1.2k", 1_500_000 → "1.5M"). Don't hand-roll `/1000`. */
 export { compactNumber } from '@/lib/format'
