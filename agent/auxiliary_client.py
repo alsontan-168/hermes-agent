@@ -265,6 +265,32 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
         # Availability probe: credentials/base_url resolved — that is the
         # answer. Skip the openai import + httpx/SSL construction entirely.
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
+    # Agent-backed providers registered out-of-tree (see
+    # agent/model_client_factories.py). The main chat path consults this in
+    # create_openai_client(); without the same hook here every auxiliary task
+    # (compression, approval, titles, vision) builds a plain httpx client for
+    # a non-HTTP endpoint like ``claude-code://local`` and dies with
+    # ``APIConnectionError: Connection error.`` — which then engages the
+    # provider fallback chain and silently spends a DIFFERENT provider's
+    # credits on work the local subscription was supposed to do.
+    # Returns None for every ordinary provider, so this is a no-op elsewhere.
+    try:
+        from agent.model_client_factories import resolve_model_client_factory
+        _factory = resolve_model_client_factory("", base_url)
+    except Exception:
+        _factory = None
+    if _factory is not None:
+        client = _factory(
+            agent=None,
+            client_kwargs={"api_key": api_key, "base_url": base_url, **kwargs},
+            reason="auxiliary",
+            shared=False,
+        )
+        if client is not None:
+            logger.info(
+                "Auxiliary: agent-backed client for %s (no HTTP wire)", base_url
+            )
+            return client
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     # OpenCode Zen free tier: the keyless placeholder must never reach the
     # wire — the Zen relay serves free models anonymously but 401s any
@@ -4085,12 +4111,51 @@ def _get_provider_chain() -> List[tuple]:
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
     """
-    return [
+    chain = [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
     ]
+    denied = _aux_fallback_denylist()
+    if not denied:
+        return chain
+    # A denied provider is removed from the chain entirely rather than being
+    # tried and discarded: the point is that its credits are never spent on
+    # background traffic the user did not ask for. Logged at WARNING (not
+    # INFO) so a skipped fallback is visible in the same breath as the
+    # failure that caused it.
+    kept = [(label, fn) for label, fn in chain if label.lower() not in denied]
+    for label, _fn in chain:
+        if label.lower() in denied:
+            logger.warning(
+                "Auxiliary fallback: %s is DENIED by "
+                "auxiliary.fallback_denylist — not used as a fallback.",
+                label,
+            )
+    return kept
+
+
+def _aux_fallback_denylist() -> set:
+    """Providers the auxiliary fallback chain must never engage.
+
+    Config (config.yaml)::
+
+        auxiliary:
+          fallback_denylist: ["openrouter"]
+
+    Read failures return an EMPTY set (fail-open): a broken config must not
+    silently strip every fallback and leave auxiliary tasks with no provider.
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get
+        raw = cfg_get(load_config(), "auxiliary", "fallback_denylist",
+                      default=[])
+    except Exception:
+        return set()
+    if not isinstance(raw, list):
+        return set()
+    return {str(p).strip().lower() for p in raw if str(p).strip()}
 
 
 # ── Auxiliary "recently 402'd" unhealthy-provider cache ────────────────────
@@ -5489,9 +5554,15 @@ def _try_payment_fallback(
             continue
         client, model = try_fn()
         if client is not None:
-            logger.info(
-                "Auxiliary %s: %s on %s — falling back to %s (%s)",
-                task or "call", reason, failed_provider, label, model or "default",
+            # WARNING, not INFO: a fallback silently spends a DIFFERENT
+            # provider's credits than the one the user configured. That is a
+            # billing event and must be visible at default log level.
+            logger.warning(
+                "Auxiliary %s: %s on %s — FALLING BACK to %s (%s). This "
+                "spends %s credits. Add %r to auxiliary.fallback_denylist "
+                "in config.yaml to forbid it.",
+                task or "call", reason, failed_provider, label,
+                model or "default", label, label,
             )
             return client, model, label
         tried.append(label)
@@ -6188,6 +6259,71 @@ def _effective_provider_for_client(client: Any, fallback: str) -> str:
 # below — never look up auth env vars ad-hoc.
 
 
+class _AsyncAgentBackedCompletionsAdapter:
+    """Async face for an agent-backed (subprocess) client's sync ``create``.
+
+    Agent-backed providers registered via ``agent/model_client_factories.py``
+    speak the OpenAI duck type SYNCHRONOUSLY — their endpoint is a local
+    process, not an HTTP service, so there is no AsyncOpenAI counterpart to
+    swap in. ``_async_call_llm_impl`` does ``await client.chat.completions
+    .create(...)``, which raises TypeError on a plain (non-awaitable) return.
+
+    Bridging via ``asyncio.to_thread`` mirrors the Anthropic/Codex/Bedrock
+    auxiliary adapters directly above. NOT a bare passthrough like
+    CopilotACPClient: that one is only ever reached on sync paths, so it never
+    had to satisfy the await.
+    """
+
+    def __init__(self, sync_client: Any):
+        self._sync = sync_client
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(
+            self._sync.chat.completions.create, **kwargs
+        )
+
+
+class _AsyncAgentBackedChatShim:
+    def __init__(self, adapter: "_AsyncAgentBackedCompletionsAdapter"):
+        self.completions = adapter
+
+
+class AsyncAgentBackedClient:
+    """Async wrapper preserving the sync client's identity attributes."""
+
+    def __init__(self, sync_client: Any):
+        self.chat = _AsyncAgentBackedChatShim(
+            _AsyncAgentBackedCompletionsAdapter(sync_client)
+        )
+        self.api_key = getattr(sync_client, "api_key", None)
+        self.base_url = getattr(sync_client, "base_url", None)
+        # Mirrored so cache eviction on the underlying client also drops this
+        # entry (same contract as AsyncCodexAuxiliaryClient._real_client).
+        self._real_client = sync_client
+
+    def close(self) -> None:
+        close = getattr(self._real_client, "close", None)
+        if callable(close):
+            close()
+
+
+def _is_agent_backed_client(client: Any) -> bool:
+    """True when ``client`` came from a model-client factory.
+
+    Keyed off the base_url scheme rather than an isinstance check: the class
+    lives in an out-of-tree plugin under $HERMES_HOME, so importing it here
+    would couple core to a plugin that may not be installed.
+    """
+    try:
+        from agent.model_client_factories import resolve_model_client_factory
+        return resolve_model_client_factory(
+            "", str(getattr(client, "base_url", "") or "")
+        ) is not None
+    except Exception:
+        return False
+
+
 def _to_async_client(sync_client, model: str, is_vision: bool = False):
     """Convert a sync client to its async counterpart, preserving Codex routing.
 
@@ -6200,6 +6336,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 
     if isinstance(sync_client, _AuxProbeClientStub):
         return sync_client, model
+    # Checked before the AsyncOpenAI construction below: an agent-backed
+    # client's base_url is a scheme like ``claude-code://local`` that httpx
+    # cannot dial, so rebuilding it as AsyncOpenAI yields a client that
+    # raises APIConnectionError on every call.
+    if _is_agent_backed_client(sync_client):
+        return AsyncAgentBackedClient(sync_client), model
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
